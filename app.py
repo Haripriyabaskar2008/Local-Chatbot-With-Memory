@@ -2,12 +2,13 @@
 import streamlit as st
 import sqlite3
 import uuid
-import os
 from datetime import datetime
 from google import genai
 from google.genai import types
 
-# ---------------- CONFIGURATION ----------------
+# ==========================================
+# 1. APP CONFIGURATION
+# ==========================================
 
 st.set_page_config(
     page_title="Local BOT",
@@ -15,21 +16,40 @@ st.set_page_config(
     layout="wide"
 )
 
-DB_NAME = "local_bot.db"
-MODEL_NAME = "gemini-2.5-flash"
+APP_NAME = "Local BOT"
+MODEL_NAME = "gemini-3.8-flash"
+DATABASE = "local_bot.db"
 
 SYSTEM_INSTRUCTION = """
-You are Local BOT, a friendly and intelligent personal AI assistant.
-Answer clearly and naturally.
-Remember useful details from the conversation history provided.
-If you do not know something, say so honestly.
-Do not invent personal information about the user.
+You are Local BOT, a friendly, intelligent personal AI assistant.
+
+USER PROFILE:
+- User's full name is Haripriya.
+- Preferred name: HP.
+
+YOUR IDENTITY:
+- Your name is Local BOT.
+- If the user asks your name, introduce yourself as Local BOT.
+- Address the user as HP when appropriate.
+
+BEHAVIOUR:
+- Be friendly, natural and helpful.
+- Understand Tamil, English and Tanglish.
+- Remember information from the conversation history provided.
+- Use previous messages to understand follow-up questions.
+- Do not invent memories or claim to remember information that is not provided.
+- Give clear and useful answers.
 """
 
-# ---------------- DATABASE ----------------
+# ==========================================
+# 2. DATABASE
+# ==========================================
 
 def get_connection():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
+    return sqlite3.connect(
+        DATABASE,
+        check_same_thread=False
+    )
 
 
 def create_database():
@@ -39,10 +59,10 @@ def create_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            role TEXT,
-            content TEXT,
-            timestamp TEXT
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TEXT NOT NULL
         )
     """)
 
@@ -55,7 +75,8 @@ def save_message(session_id, role, content):
     cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT INTO messages (session_id, role, content, timestamp)
+        INSERT INTO messages
+        (session_id, role, content, timestamp)
         VALUES (?, ?, ?, ?)
     """, (
         session_id,
@@ -79,139 +100,211 @@ def get_history(session_id):
         ORDER BY id ASC
     """, (session_id,))
 
-    messages = cursor.fetchall()
+    history = cursor.fetchall()
     conn.close()
 
-    return messages
+    return history
 
 
 def clear_history(session_id):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute(
-        "DELETE FROM messages WHERE session_id = ?",
-        (session_id,)
-    )
+    cursor.execute("""
+        DELETE FROM messages
+        WHERE session_id = ?
+    """, (session_id,))
 
     conn.commit()
     conn.close()
 
 
-# ---------------- GEMINI ----------------
+# ==========================================
+# 3. GEMINI CLIENT
+# ==========================================
 
-def get_gemini_client():
-    api_key = None
-
-    try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key:
-        st.error("Gemini API key not found. Configure it in Streamlit Secrets.")
-        st.stop()
-
+@st.cache_resource
+def get_gemini_client(api_key):
     return genai.Client(api_key=api_key)
 
 
-def generate_response(client, session_id, user_message):
+def get_api_key():
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return None
+
+
+def generate_response(client, session_id):
+
     history = get_history(session_id)
+
+    # Keep the latest 30 messages as conversation context
+    recent_history = history[-30:]
 
     conversation = []
 
-    # Keep recent context to control token usage
-    for role, content in history[-20:]:
-        speaker = "User" if role == "user" else "Local BOT"
-        conversation.append(f"{speaker}: {content}")
+    for role, content in recent_history:
 
-    conversation.append(f"User: {user_message}")
-    conversation.append("Local BOT:")
+        if role == "user":
+            gemini_role = "user"
+        else:
+            gemini_role = "model"
 
-    prompt = "\n\n".join(conversation)
+        conversation.append(
+            types.Content(
+                role=gemini_role,
+                parts=[
+                    types.Part.from_text(text=content)
+                ]
+            )
+        )
 
     response = client.models.generate_content(
         model=MODEL_NAME,
-        contents=prompt,
+        contents=conversation,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.7,
-            max_output_tokens=1500
+            system_instruction=SYSTEM_INSTRUCTION
         )
     )
 
-    return response.text or "I couldn't generate a response. Please try again."
+    if response.text:
+        return response.text
+
+    return "I couldn't generate a response. Please try again."
 
 
-# ---------------- INITIALIZATION ----------------
+# ==========================================
+# 4. INITIALIZATION
+# ==========================================
 
 create_database()
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
-if "client" not in st.session_state:
-    st.session_state.client = get_gemini_client()
-
 session_id = st.session_state.session_id
-client = st.session_state.client
 
-# ---------------- SIDEBAR ----------------
+api_key = get_api_key()
+
+# ==========================================
+# 5. SIDEBAR
+# ==========================================
 
 with st.sidebar:
+
     st.title("🤖 Local BOT")
-    st.caption("Your personal AI chatbot")
+
+    st.caption("Your personal AI assistant")
 
     st.divider()
 
-    st.subheader("Memory")
+    st.subheader("👤 User Profile")
 
-    st.write("Your current conversation is stored in the app database.")
+    st.write("Name: Haripriya")
+    st.write("Preferred name: HP")
 
-    if st.button("🗑️ Clear Conversation", use_container_width=True):
+    st.divider()
+
+    st.subheader("🧠 Memory")
+
+    st.write("Conversation history is saved in the database.")
+
+    if st.button(
+        "🗑️ Clear Conversation",
+        use_container_width=True
+    ):
+
         clear_history(session_id)
         st.rerun()
 
     st.divider()
 
-    st.caption("Powered by Google Gemini")
-    st.caption("Built with Streamlit and Python")
+    st.caption("AI Model: Gemini 3.8 Flash")
+    st.caption("Built using Python and Streamlit")
 
-# ---------------- MAIN INTERFACE ----------------
+
+# ==========================================
+# 6. MAIN CHAT INTERFACE
+# ==========================================
 
 st.title("🤖 Local BOT")
-st.write("Hello! I'm your personal AI assistant. How can I help you today?")
+
+st.write(
+    "Hello HP! Welcome back. "
+    "I'm Local BOT. What would you like to talk about?"
+)
 
 st.divider()
 
-# Display previous messages
+# Check API key
+if not api_key:
+
+    st.error(
+        "Gemini API key is missing. "
+        "Please configure GEMINI_API_KEY in Streamlit Secrets."
+    )
+
+    st.stop()
+
+# Initialize Gemini
+try:
+    client = get_gemini_client(api_key)
+
+except Exception as error:
+
+    st.error(f"Gemini connection failed: {error}")
+    st.stop()
+
+
+# ==========================================
+# 7. DISPLAY CHAT HISTORY
+# ==========================================
+
 history = get_history(session_id)
 
 for role, content in history:
+
     with st.chat_message(role):
         st.markdown(content)
 
-# Chat input
-user_message = st.chat_input("Ask Local BOT anything...")
+
+# ==========================================
+# 8. USER INPUT AND AI RESPONSE
+# ==========================================
+
+user_message = st.chat_input(
+    "Message Local BOT..."
+)
 
 if user_message:
-    # Save user message
-    save_message(session_id, "user", user_message)
 
+    # Save user's message
+    save_message(
+        session_id,
+        "user",
+        user_message
+    )
+
+    # Display user message
     with st.chat_message("user"):
         st.markdown(user_message)
 
+    # Generate AI response
     with st.chat_message("assistant"):
+
         with st.spinner("Local BOT is thinking..."):
+
             try:
+
                 answer = generate_response(
                     client,
-                    session_id,
-                    user_message
+                    session_id
                 )
 
                 st.markdown(answer)
 
+                # Save assistant response
                 save_message(
                     session_id,
                     "assistant",
@@ -219,5 +312,7 @@ if user_message:
                 )
 
             except Exception as error:
-                st.error(f"Something went wrong: {error}")
 
+                st.error(
+                    f"Something went wrong: {error}"
+                )
