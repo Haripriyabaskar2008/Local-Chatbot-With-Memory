@@ -1,465 +1,223 @@
 
 import streamlit as st
-import requests
+import sqlite3
+import uuid
+import os
+from datetime import datetime
+from google import genai
+from google.genai import types
 
-from database import (
-    initialize_database,
-    create_chat,
-    get_all_chats,
-    get_chat,
-    save_chat,
-    delete_chat,
-    get_all_memories,
-    delete_memory
-)
-
-from memory import (
-    extract_memories,
-    get_memory_context
-)
-
-
-# --------------------------------
-# CONFIGURATION
-# --------------------------------
-
-OLLAMA_URL = "http://localhost:11434"
+# ---------------- CONFIGURATION ----------------
 
 st.set_page_config(
     page_title="Local BOT",
     page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-initialize_database()
+DB_NAME = "local_bot.db"
+MODEL_NAME = "gemini-2.5-flash"
 
-
-# --------------------------------
-# CUSTOM DESIGN
-# --------------------------------
-
-st.markdown("""
-<style>
-
-.stApp {
-    background: #101114;
-    color: #ffffff;
-}
-
-[data-testid="stSidebar"] {
-    background: #191b22;
-}
-
-.main-title {
-    font-size: 36px;
-    font-weight: 700;
-    color: #ffffff;
-}
-
-.subtitle {
-    color: #9ca3af;
-    font-size: 14px;
-}
-
-.stChatMessage {
-    border-radius: 15px;
-}
-
-div.stButton > button {
-    border-radius: 10px;
-    border: 1px solid #363944;
-}
-
-div[data-testid="stChatInput"] {
-    border-radius: 15px;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-
-# --------------------------------
-# SESSION STATE
-# --------------------------------
-
-if "chat_id" not in st.session_state:
-    st.session_state.chat_id = None
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "model" not in st.session_state:
-    st.session_state.model = "llama3.2:3b"
-
-
-# --------------------------------
-# OLLAMA CONNECTION
-# --------------------------------
-
-def get_models():
-
-    try:
-
-        response = requests.get(
-            f"{OLLAMA_URL}/api/tags",
-            timeout=3
-        )
-
-        response.raise_for_status()
-
-        models = response.json().get("models", [])
-
-        return [model["name"] for model in models]
-
-    except requests.RequestException:
-        return []
-
-
-def generate_response(messages, model):
-
-    memory_context = get_memory_context()
-
-    system_prompt = f"""
-You are Local BOT, a friendly personal AI assistant.
-
-You have access to the user's saved memories.
-
-Use them when they are relevant to the question.
-
-Do not invent personal information.
-
-Be helpful, natural and conversational.
-
-SAVED MEMORIES:
-
-{memory_context}
+SYSTEM_INSTRUCTION = """
+You are Local BOT, a friendly and intelligent personal AI assistant.
+Answer clearly and naturally.
+Remember useful details from the conversation history provided.
+If you do not know something, say so honestly.
+Do not invent personal information about the user.
 """
 
-    conversation = [
-        {
-            "role": "system",
-            "content": system_prompt
-        }
-    ]
+# ---------------- DATABASE ----------------
 
-    conversation.extend(messages[-20:])
+def get_connection():
+    return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+
+def create_database():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_message(session_id, role, content):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO messages (session_id, role, content, timestamp)
+        VALUES (?, ?, ?, ?)
+    """, (
+        session_id,
+        role,
+        content,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_history(session_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT role, content
+        FROM messages
+        WHERE session_id = ?
+        ORDER BY id ASC
+    """, (session_id,))
+
+    messages = cursor.fetchall()
+    conn.close()
+
+    return messages
+
+
+def clear_history(session_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "DELETE FROM messages WHERE session_id = ?",
+        (session_id,)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ---------------- GEMINI ----------------
+
+def get_gemini_client():
+    api_key = None
 
     try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = os.getenv("GEMINI_API_KEY")
 
-        with requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": model,
-                "messages": conversation,
-                "stream": True
-            },
-            stream=True,
-            timeout=(10, 600)
-        ) as response:
+    if not api_key:
+        st.error("Gemini API key not found. Configure it in Streamlit Secrets.")
+        st.stop()
 
-            response.raise_for_status()
-
-            for line in response.iter_lines():
-
-                if not line:
-                    continue
-
-                import json
-
-                data = json.loads(line)
-
-                content = data.get(
-                    "message", {}
-                ).get("content", "")
-
-                if content:
-                    yield content
-
-                if data.get("done"):
-                    break
-
-    except requests.RequestException as error:
-
-        raise RuntimeError(
-            "Cannot connect to Ollama. "
-            "Please make sure Ollama is running."
-        ) from error
+    return genai.Client(api_key=api_key)
 
 
-# --------------------------------
-# SIDEBAR
-# --------------------------------
+def generate_response(client, session_id, user_message):
+    history = get_history(session_id)
+
+    conversation = []
+
+    # Keep recent context to control token usage
+    for role, content in history[-20:]:
+        speaker = "User" if role == "user" else "Local BOT"
+        conversation.append(f"{speaker}: {content}")
+
+    conversation.append(f"User: {user_message}")
+    conversation.append("Local BOT:")
+
+    prompt = "\n\n".join(conversation)
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            temperature=0.7,
+            max_output_tokens=1500
+        )
+    )
+
+    return response.text or "I couldn't generate a response. Please try again."
+
+
+# ---------------- INITIALIZATION ----------------
+
+create_database()
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "client" not in st.session_state:
+    st.session_state.client = get_gemini_client()
+
+session_id = st.session_state.session_id
+client = st.session_state.client
+
+# ---------------- SIDEBAR ----------------
 
 with st.sidebar:
-
     st.title("🤖 Local BOT")
-
-    st.caption("Your personal AI assistant")
-
-    st.divider()
-
-    # Model selection
-
-    models = get_models()
-
-    if models:
-
-        selected_model = st.selectbox(
-            "AI Model",
-            models,
-            index=(
-                models.index(st.session_state.model)
-                if st.session_state.model in models
-                else 0
-            )
-        )
-
-        st.session_state.model = selected_model
-
-    else:
-
-        st.error("Ollama is not connected.")
-
-        st.caption(
-            "Start Ollama and download a model."
-        )
+    st.caption("Your personal AI chatbot")
 
     st.divider()
 
-    # New Chat
+    st.subheader("Memory")
 
-    if st.button(
-        "＋ New Chat",
-        use_container_width=True
-    ):
+    st.write("Your current conversation is stored in the app database.")
 
-        st.session_state.chat_id = create_chat()
-        st.session_state.messages = []
-
+    if st.button("🗑️ Clear Conversation", use_container_width=True):
+        clear_history(session_id)
         st.rerun()
 
-    st.subheader("Chat History")
-
-    chats = get_all_chats()
-
-    for chat in chats:
-
-        col1, col2 = st.columns([5, 1])
-
-        with col1:
-
-            title = chat["title"]
-
-            if len(title) > 25:
-                title = title[:25] + "..."
-
-            if st.button(
-                title,
-                key=f"chat_{chat['id']}",
-                use_container_width=True
-            ):
-
-                selected_chat = get_chat(chat["id"])
-
-                st.session_state.chat_id = chat["id"]
-
-                st.session_state.messages = (
-                    selected_chat["messages"]
-                    if selected_chat
-                    else []
-                )
-
-                st.rerun()
-
-        with col2:
-
-            if st.button(
-                "🗑️",
-                key=f"delete_{chat['id']}"
-            ):
-
-                delete_chat(chat["id"])
-
-                if st.session_state.chat_id == chat["id"]:
-                    st.session_state.chat_id = None
-                    st.session_state.messages = []
-
-                st.rerun()
-
     st.divider()
 
-    # Memory section
+    st.caption("Powered by Google Gemini")
+    st.caption("Built with Streamlit and Python")
 
-    with st.expander("🧠 My Memory"):
+# ---------------- MAIN INTERFACE ----------------
 
-        memories = get_all_memories()
-
-        if memories:
-
-            for item in memories:
-
-                st.write(f"• {item['content']}")
-
-                if st.button(
-                    "Delete",
-                    key=f"mem_{item['id']}"
-                ):
-
-                    delete_memory(item["id"])
-                    st.rerun()
-
-        else:
-
-            st.caption("No memories saved yet.")
-
-    st.divider()
-
-    st.caption("Powered by Ollama + SQLite")
-    st.caption("100% Local AI")
-
-
-# --------------------------------
-# MAIN PAGE
-# --------------------------------
-
-st.markdown(
-    '<div class="main-title">Local BOT</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="subtitle">'
-    'A chatbot that remembers your conversations.'
-    '</div>',
-    unsafe_allow_html=True
-)
+st.title("🤖 Local BOT")
+st.write("Hello! I'm your personal AI assistant. How can I help you today?")
 
 st.divider()
 
+# Display previous messages
+history = get_history(session_id)
 
-# --------------------------------
-# CREATE FIRST CHAT
-# --------------------------------
+for role, content in history:
+    with st.chat_message(role):
+        st.markdown(content)
 
-if st.session_state.chat_id is None:
+# Chat input
+user_message = st.chat_input("Ask Local BOT anything...")
 
-    st.session_state.chat_id = create_chat()
-
-    st.session_state.messages = []
-
-
-# --------------------------------
-# WELCOME SCREEN
-# --------------------------------
-
-if not st.session_state.messages:
-
-    st.markdown(
-        "<h3 style='text-align:center;'>"
-        "Hello! Welcome to Local BOT 👋"
-        "</h3>",
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        "<p style='text-align:center;color:#999;'>"
-        "Ask me anything. I'll remember useful things "
-        "you share with me."
-        "</p>",
-        unsafe_allow_html=True
-    )
-
-
-# --------------------------------
-# DISPLAY MESSAGES
-# --------------------------------
-
-for message in st.session_state.messages:
-
-    with st.chat_message(message["role"]):
-
-        st.markdown(message["content"])
-
-
-# --------------------------------
-# CHAT INPUT
-# --------------------------------
-
-user_input = st.chat_input(
-    "Message Local BOT..."
-)
-
-
-if user_input:
-
-    # Save user message in session
-
-    user_message = {
-        "role": "user",
-        "content": user_input
-    }
-
-    st.session_state.messages.append(user_message)
+if user_message:
+    # Save user message
+    save_message(session_id, "user", user_message)
 
     with st.chat_message("user"):
-        st.markdown(user_input)
-
-    # Generate assistant response
+        st.markdown(user_message)
 
     with st.chat_message("assistant"):
-
-        try:
-
-            response = st.write_stream(
-                generate_response(
-                    st.session_state.messages,
-                    st.session_state.model
+        with st.spinner("Local BOT is thinking..."):
+            try:
+                answer = generate_response(
+                    client,
+                    session_id,
+                    user_message
                 )
-            )
 
-            assistant_message = {
-                "role": "assistant",
-                "content": response
-            }
+                st.markdown(answer)
 
-            st.session_state.messages.append(
-                assistant_message
-            )
+                save_message(
+                    session_id,
+                    "assistant",
+                    answer
+                )
 
-            # Extract long-term memory
+            except Exception as error:
+                st.error(f"Something went wrong: {error}")
 
-            extract_memories(
-                user_input,
-                st.session_state.model
-            )
-
-            # Create chat title
-
-            current_chat = get_chat(
-                st.session_state.chat_id
-            )
-
-            if current_chat["title"] == "New Chat":
-
-                title = user_input[:40]
-
-            else:
-
-                title = current_chat["title"]
-
-            # Save all conversations
-
-            save_chat(
-                st.session_state.chat_id,
-                st.session_state.messages,
-                title
-            )
-
-        except Exception as error:
-
-            st.error(str(error))
-
-            st.session_state.messages.pop()
-
-    st.rerun()
